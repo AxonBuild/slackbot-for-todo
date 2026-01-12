@@ -67,13 +67,15 @@ def get_todo_extraction_prompt(
         # Use user_name if available (enriched), otherwise fallback to user (which should be name now)
         user = msg.get('user_name') or msg.get('user', 'Unknown')
         text = msg.get('text', '')
-        timestamp = msg.get('ts', '')
+        # Use human-readable timestamp if available, otherwise use raw ts
+        timestamp = msg.get('timestamp_readable', msg.get('ts', ''))
         messages_text += f"[{timestamp}] {user}: {text}\n"
     
         # Add context about previously extracted todos if available
     if last_bot_message:
         bot_text = last_bot_message.get('text', '')
-        bot_timestamp = last_bot_message.get('ts', '')
+        # Use human-readable timestamp if available, otherwise use raw ts
+        bot_timestamp = last_bot_message.get('timestamp_readable', last_bot_message.get('ts', ''))
         
         bot_message_text = "# Last Bot Message from the Channel:\n"
         bot_message_text += f"[{bot_timestamp}] {bot_text}"
@@ -92,6 +94,7 @@ def get_todo_extraction_prompt(
 
 # Task
 - Analyze the Slack conversation and extract all todos and action items that are still pending and need to be done.
+- If an imperative sentence is said by person X, that is a todo for person Y.
 {special_instructions}
     
 For each todo, identify:

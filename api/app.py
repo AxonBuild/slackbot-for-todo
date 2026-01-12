@@ -57,7 +57,7 @@ def get_services():
     if llm_client is None:
         provider = os.getenv("LLM_PROVIDER", "openai")
         logger.info(f"Initializing LLM client with provider: {provider}")
-        llm_client = create_llm_client(provider=provider)
+        llm_client = create_llm_client(provider=provider, model="gpt-4.1-mini")
         todo_extractor = TodoExtractor(llm_client)
         logger.info("LLM client and TodoExtractor initialized")
     

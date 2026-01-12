@@ -12,6 +12,25 @@ import re
 logger = logging.getLogger(__name__)
 
 
+def convert_slack_timestamp_to_readable(ts: str) -> str:
+    """
+    Convert Slack timestamp to human-readable format.
+    
+    Args:
+        ts: Slack timestamp string (e.g., "1234567890.123456")
+    
+    Returns:
+        Human-readable timestamp (e.g., "2023-01-15 14:30:45")
+    """
+    try:
+        # Slack timestamps are in format "seconds.microseconds"
+        timestamp_float = float(ts)
+        dt = datetime.fromtimestamp(timestamp_float)
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except (ValueError, TypeError):
+        return ts  # Return original if conversion fails
+
+
 class SlackService:
     """Service to interact with Slack API for fetching messages."""
     
@@ -113,7 +132,7 @@ class SlackService:
             for i, msg in enumerate(messages, 1):
                 logger.debug(f"\nMessage #{i}:")
                 logger.debug(f"  User: {msg.get('user', 'N/A')} ({msg.get('user_name', 'N/A')})")
-                logger.debug(f"  Timestamp: {msg.get('ts', 'N/A')}")
+                logger.debug(f"  Timestamp: {msg.get('timestamp_readable', msg.get('ts', 'N/A'))}")
                 logger.debug(f"  Text: {msg.get('text', 'N/A')}")
                 logger.debug(f"  Type: {msg.get('type', 'N/A')}")
                 logger.debug(f"  Subtype: {msg.get('subtype', 'N/A')}")
@@ -242,11 +261,17 @@ class SlackService:
                         try:
                             bot_info = self.client.bots_info(bot=msg['bot_id'])
                             if bot_info.get('bot', {}).get('user_id') == bot_user_id:
+                                # Add human-readable timestamp
+                                if 'ts' in msg:
+                                    msg['timestamp_readable'] = convert_slack_timestamp_to_readable(msg['ts'])
                                 logger.info(f"Found last bot message in '{channel_name_or_id}': {msg.get('text', '')[:50]}...")
                                 return msg
                         except:
                             pass
                     else:
+                        # Add human-readable timestamp
+                        if 'ts' in msg:
+                            msg['timestamp_readable'] = convert_slack_timestamp_to_readable(msg['ts'])
                         logger.info(f"Found last bot message in '{channel_name_or_id}': {msg.get('text', '')[:50]}...")
                         return msg
             
@@ -333,9 +358,13 @@ class SlackService:
             if 'text' in enriched_msg:
                 enriched_msg['text'] = replace_user_mentions(enriched_msg['text'])
             
+            # Add human-readable timestamp
+            if 'ts' in enriched_msg:
+                enriched_msg['timestamp_readable'] = convert_slack_timestamp_to_readable(enriched_msg['ts'])
+            
             enriched_messages.append(enriched_msg)
         
-        logger.debug(f"Enriched {len(enriched_messages)} messages with user names")
+        logger.debug(f"Enriched {len(enriched_messages)} messages with user names and readable timestamps")
         return enriched_messages
     
     def post_message(self, channel_name_or_id: str, text: str, blocks: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
