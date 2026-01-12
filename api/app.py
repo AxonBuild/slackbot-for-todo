@@ -1,6 +1,7 @@
 """FastAPI application for todo extraction API."""
 
 import logging
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
@@ -19,11 +20,28 @@ logger = logging.getLogger(__name__)
 # Load environment variables
 load_dotenv()
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan context manager for startup and shutdown events."""
+    # Startup
+    logger.info("Starting up Slack Todo Extraction API v2.0")
+    logger.info("API ready - waiting for external scheduler to trigger requests")
+    logger.info("API startup complete")
+    
+    yield
+    
+    # Shutdown
+    logger.info("Shutting down Slack Todo Extraction API")
+    logger.info("API shutdown complete")
+
+
 # Initialize FastAPI app
 app = FastAPI(
     title="Slack Todo Extraction API",
     description="API to extract todos from Slack messages using LLM - triggered by external schedulers",
-    version="2.0.0"
+    version="2.0.0",
+    lifespan=lifespan
 )
 
 # Initialize services (lazy initialization)
@@ -49,91 +67,6 @@ def get_services():
         logger.info("Slack service initialized")
     
     return slack_service, todo_extractor
-
-
-# Removed scheduler function - API is now triggered by external schedulers
-
-
-def _post_todos_to_slack(channel_name_or_id: str, todos: List[Dict[str, Any]], service: SlackService):
-    """
-    Post extracted todos to Slack channel.
-    
-    Args:
-        channel_name_or_id: Name or ID of the Slack channel
-        todos: List of todo dictionaries
-        service: SlackService instance
-    """
-    logger.info(f"Posting {len(todos)} todos to Slack channel: {channel_name_or_id}")
-    
-    # Format todos for Slack
-    if len(todos) == 1:
-        header = f"📋 *1 Todo Found*"
-    else:
-        header = f"📋 *{len(todos)} Todos Found*"
-    
-    # Build message text
-    message_text = f"{header}\n\n"
-    for i, todo in enumerate(todos, 1):
-        description = todo.get('description', 'N/A')
-        assigned_to = todo.get('assigned_to')
-        
-        todo_line = f"*{i}.* {description}"
-        if assigned_to:
-            todo_line += f" (Assigned to: {assigned_to})"
-        message_text += f"{todo_line}\n"
-    
-    # Create Slack blocks for better formatting
-    blocks = [
-        {
-            "type": "header",
-            "text": {
-                "type": "plain_text",
-                "text": header,
-                "emoji": True
-            }
-        },
-        {
-            "type": "divider"
-        }
-    ]
-    
-    # Add each todo as a section
-    for i, todo in enumerate(todos, 1):
-        description = todo.get('description', 'N/A')
-        assigned_to = todo.get('assigned_to')
-        
-        todo_text = f"*{i}.* {description}"
-        if assigned_to:
-            todo_text += f"\n👤 Assigned to: {assigned_to}"
-        
-        blocks.append({
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": todo_text
-            }
-        })
-        
-        # Add divider between todos (except after the last one)
-        if i < len(todos):
-            blocks.append({"type": "divider"})
-    
-    # Post to Slack
-    service.post_message(channel_name_or_id, message_text, blocks=blocks)
-    logger.info("Successfully posted todos to Slack")
-
-
-@app.on_event("startup")
-async def startup_event():
-    logger.info("Starting up Slack Todo Extraction API v2.0")
-    logger.info("API ready - waiting for external scheduler to trigger requests")
-    logger.info("API startup complete")
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    logger.info("Shutting down Slack Todo Extraction API")
-    logger.info("API shutdown complete")
 
 
 # Request and Response models
@@ -193,8 +126,6 @@ async def health():
     """Health check endpoint."""
     logger.debug("Health check requested")
     return {"status": "healthy"}
-
-
 
 
 @app.get("/channels")
@@ -300,8 +231,16 @@ async def extract_todos_from_slack(request: ExtractTodosRequest):
             logger.info(f"{'=' * 60}")
             
             try:
+                # Fetch last bot message to avoid duplicates
+                last_bot_message = slack_svc.get_last_bot_message(channel_id)
+                if last_bot_message:
+                    logger.info(f"Found previous bot message in {channel_display} - will use to avoid duplicates")
+                
                 # Fetch messages
-                messages = slack_svc.get_channel_messages(channel_id, request.minutes_ago, request.message_limit)
+                minutes_ago = request.minutes_ago if last_bot_message else 5000
+                logger.info(f"Fetching messages from {channel_display} (minutes_ago={minutes_ago})")
+                
+                messages = slack_svc.get_channel_messages(channel_id, minutes_ago, request.message_limit)
                 logger.info(f"Retrieved {len(messages)} messages from {channel_display}")
                 
                 if not messages:
@@ -319,7 +258,7 @@ async def extract_todos_from_slack(request: ExtractTodosRequest):
                 
                 # Extract todos
                 logger.info(f"Extracting todos from {len(messages)} messages in {channel_display}")
-                todos = extractor.extract_todos(messages)
+                todos = extractor.extract_todos(messages, last_bot_message)
                 logger.info(f"Extracted {len(todos)} todos from {channel_display}")
                 
                 # Convert to response model
@@ -341,7 +280,7 @@ async def extract_todos_from_slack(request: ExtractTodosRequest):
                     # Post to Slack if requested
                     if request.post_to_slack and channel_identifier:
                         try:
-                            _post_todos_to_slack(channel_identifier, todos, slack_svc)
+                            slack_svc.post_todos_to_channel(channel_identifier, todos)
                         except Exception as e:
                             logger.error(f"Error posting todos to {channel_display}: {str(e)}", exc_info=True)
                 else:

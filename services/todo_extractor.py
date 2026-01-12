@@ -20,12 +20,17 @@ class TodoExtractor:
         """
         self.llm_client = llm_client
     
-    def extract_todos(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def extract_todos(
+        self, 
+        messages: List[Dict[str, Any]], 
+        last_bot_message: Optional[Dict[str, Any]] = None
+    ) -> List[Dict[str, Any]]:
         """
         Extract todos from a list of messages using function calling.
         
         Args:
             messages: List of message dictionaries with 'text', 'user', 'ts' keys
+            last_bot_message: Optional last message sent by the bot (to avoid duplicates)
         
         Returns:
             List of extracted todo dictionaries
@@ -35,6 +40,8 @@ class TodoExtractor:
             return []
         
         logger.info(f"Starting todo extraction from {len(messages)} messages")
+        if last_bot_message:
+            logger.info("Including last bot message context to avoid duplicates")
         
         # Import here to avoid circular imports
         from prompts.todo_extraction import (
@@ -42,8 +49,8 @@ class TodoExtractor:
             get_todo_extraction_function_schema
         )
         
-        # Generate prompt
-        prompt = get_todo_extraction_prompt(messages)
+        # Generate prompt with optional last bot message context
+        prompt = get_todo_extraction_prompt(messages, last_bot_message)
         
         # Log the prompt
         logger.debug("=" * 80)

@@ -7,6 +7,7 @@ import os
 from dotenv import load_dotenv
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +30,7 @@ class SlackService:
             raise ValueError("SLACK_BOT_TOKEN not found. Set it in environment variables or pass as argument.")
         
         self.client = WebClient(token=self.token)
+        self._bot_user_id = None  # Cache bot's user ID
         logger.info("SlackService initialized successfully")
     
     def get_channel_messages(
@@ -62,7 +64,7 @@ class SlackService:
             else:
                 # Find channel ID by name
                 logger.debug("Listing available channels")
-                response = self.client.conversations_list(types="public_channel,private_channel,mpim,im")
+                response = self.client.conversations_list(types="public_channel,private_channel")
                 channels = response["channels"]
                 logger.debug(f"Found {len(channels)} available channels")
                 
@@ -92,12 +94,14 @@ class SlackService:
             logger.debug(f"Fetching conversation history for channel {channel_id}")
             result = self.client.conversations_history(
                 channel=channel_id,
-                limit=limit,
+                limit=1000,
                 oldest=oldest_ts
             )
             
             messages = result["messages"]
-            logger.info(f"Successfully retrieved {len(messages)} messages from channel '{channel_name}'")
+            messages = messages[:limit]
+            messages = list(reversed(messages))
+            logger.info(f"Successfully retrieved {len(messages)} messages from channel '{channel_name_or_id}'")
             
             # Enrich messages with user names
             messages = self._enrich_messages_with_user_names(messages)
@@ -125,26 +129,26 @@ class SlackService:
     
     def list_channels(self) -> List[Dict[str, Any]]:
         """
-        List all available channels and conversations that the bot is a member of.
-        This includes public channels, private channels, and direct messages.
+        List all available channels that the bot is a member of.
+        This includes public channels and private channels only (no DMs).
         
         Returns:
-            List of channel/conversation dictionaries
+            List of channel dictionaries
         """
         try:
-            # Get all conversations the bot is a member of
-            # Types: public_channel, private_channel, mpim (multi-party DM), im (direct message)
+            # Get all channels the bot is a member of
+            # Types: public_channel, private_channel (excludes DMs)
             response = self.client.conversations_list(
-                types="public_channel,private_channel,mpim,im",
+                types="public_channel,private_channel",
                 exclude_archived=True,
                 limit=1000  # Increase limit to get more channels
             )
             channels = response["channels"]
             
-            # Filter to only conversations the bot is a member of
+            # Filter to only channels the bot is a member of
             member_channels = [ch for ch in channels if ch.get('is_member', False)]
             
-            logger.info(f"Bot is a member of {len(member_channels)} out of {len(channels)} total conversations")
+            logger.info(f"Bot is a member of {len(member_channels)} out of {len(channels)} total channels")
             return member_channels
         except SlackApiError as e:
             error_msg = e.response.get('error', str(e)) if hasattr(e, 'response') else str(e)
@@ -167,9 +171,100 @@ class SlackService:
             error_msg = e.response.get('error', str(e)) if hasattr(e, 'response') else str(e)
             raise Exception(f"Error fetching user info: {error_msg}")
     
+    def get_bot_user_id(self) -> str:
+        """
+        Get the bot's own user ID.
+        
+        Returns:
+            Bot's user ID
+        """
+        if self._bot_user_id:
+            return self._bot_user_id
+        
+        try:
+            response = self.client.auth_test()
+            self._bot_user_id = response["user_id"]
+            logger.info(f"Bot user ID: {self._bot_user_id}")
+            return self._bot_user_id
+        except SlackApiError as e:
+            error_msg = e.response.get('error', str(e)) if hasattr(e, 'response') else str(e)
+            raise Exception(f"Error fetching bot user ID: {error_msg}")
+    
+    def get_last_bot_message(self, channel_name_or_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get the last message sent by this bot in a channel.
+        
+        Args:
+            channel_name_or_id: Name of the Slack channel or channel ID
+        
+        Returns:
+            Last bot message dictionary or None if not found
+        """
+        logger.debug(f"Fetching last bot message from '{channel_name_or_id}'")
+        
+        try:
+            # Get bot's user ID
+            bot_user_id = self.get_bot_user_id()
+            
+            # Check if it's already a channel ID (starts with C, D, or G)
+            if channel_name_or_id.startswith(('C', 'D', 'G')):
+                channel_id = channel_name_or_id
+            else:
+                # Find channel ID by name
+                response = self.client.conversations_list(types="public_channel,private_channel")
+                channels = response["channels"]
+                
+                channel_id = None
+                for channel in channels:
+                    if channel.get("name", "").lower() == channel_name_or_id.lower():
+                        channel_id = channel["id"]
+                        break
+                
+                if not channel_id:
+                    logger.warning(f"Channel '{channel_name_or_id}' not found")
+                    return None
+            
+            # Fetch recent messages
+            result = self.client.conversations_history(
+                channel=channel_id,
+                limit=100  # Look at last 100 messages
+            )
+            
+            messages = result["messages"]
+            
+            # Find the last message from this bot
+            for msg in messages:
+                # Check if message is from the bot (by user ID or bot_id)
+                if msg.get('user') == bot_user_id or msg.get('bot_id'):
+                    # Additional check: ensure it's our bot if bot_id is present
+                    if msg.get('bot_id'):
+                        # Try to get bot info to verify
+                        try:
+                            bot_info = self.client.bots_info(bot=msg['bot_id'])
+                            if bot_info.get('bot', {}).get('user_id') == bot_user_id:
+                                logger.info(f"Found last bot message in '{channel_name_or_id}': {msg.get('text', '')[:50]}...")
+                                return msg
+                        except:
+                            pass
+                    else:
+                        logger.info(f"Found last bot message in '{channel_name_or_id}': {msg.get('text', '')[:50]}...")
+                        return msg
+            
+            logger.debug(f"No bot messages found in '{channel_name_or_id}'")
+            return None
+            
+        except SlackApiError as e:
+            error_msg = e.response.get('error', str(e)) if hasattr(e, 'response') else str(e)
+            logger.warning(f"Error fetching last bot message: {error_msg}")
+            return None
+        except Exception as e:
+            logger.warning(f"Error fetching last bot message: {str(e)}")
+            return None
+    
     def _enrich_messages_with_user_names(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
         Replace user IDs with user names in messages.
+        Also replaces user ID mentions in message text (e.g., <@U12345678> -> @Username).
         
         Args:
             messages: List of message dictionaries
@@ -207,6 +302,21 @@ class SlackService:
                 user_cache[user_id] = user_id
                 return user_id
         
+        def replace_user_mentions(text: str) -> str:
+            """Replace user ID mentions in text with user names."""
+            if not text:
+                return text
+            
+            # Pattern to match Slack user mentions: <@U12345678> or <@U12345678|username>
+            pattern = r'<@([A-Z0-9]+)(?:\|[^>]+)?>'
+            
+            def replace_mention(match):
+                user_id = match.group(1)
+                user_name = get_user_name(user_id)
+                return f"@{user_name}"
+            
+            return re.sub(pattern, replace_mention, text)
+        
         # Enrich each message
         enriched_messages = []
         for msg in messages:
@@ -218,6 +328,10 @@ class SlackService:
                 enriched_msg['user_name'] = user_name
                 # Replace user ID with name in the message for LLM processing
                 enriched_msg['user'] = user_name
+            
+            # Replace user mentions in message text
+            if 'text' in enriched_msg:
+                enriched_msg['text'] = replace_user_mentions(enriched_msg['text'])
             
             enriched_messages.append(enriched_msg)
         
@@ -249,7 +363,7 @@ class SlackService:
                 logger.info(f"Using provided channel ID: {channel_id}")
             else:
                 # Find channel ID by name
-                response = self.client.conversations_list(types="public_channel,private_channel,mpim,im")
+                response = self.client.conversations_list(types="public_channel,private_channel")
                 channels = response["channels"]
                 
                 channel_id = None
@@ -282,4 +396,79 @@ class SlackService:
             error_msg = e.response.get('error', str(e)) if hasattr(e, 'response') else str(e)
             logger.error(f"Slack API error posting message: {error_msg}", exc_info=True)
             raise Exception(f"Error posting message to Slack: {error_msg}")
+    
+    def post_todos_to_channel(self, channel_name_or_id: str, todos: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Post extracted todos to a Slack channel with rich formatting.
+        
+        Args:
+            channel_name_or_id: Name or ID of the Slack channel
+            todos: List of todo dictionaries (each should have 'description' and optional 'assigned_to')
+        
+        Returns:
+            Response dictionary from Slack API
+        
+        Raises:
+            ValueError: If channel is not found
+            Exception: If there's an error posting the message
+        """
+        logger.info(f"Posting {len(todos)} todos to Slack channel: {channel_name_or_id}")
+        
+        # Format todos for Slack
+        if len(todos) == 1:
+            header = f"📋 *1 Todo Found*"
+        else:
+            header = f"📋 *{len(todos)} Todos Found*"
+        
+        # Build message text (fallback for notifications)
+        message_text = f"{header}\n\n"
+        for i, todo in enumerate(todos, 1):
+            description = todo.get('description', 'N/A')
+            assigned_to = todo.get('assigned_to')
+            
+            todo_line = f"*{i}.* {description}"
+            if assigned_to:
+                todo_line += f" (Assigned to: {assigned_to})"
+            message_text += f"{todo_line}\n"
+        
+        # Create Slack blocks for better formatting
+        blocks = [
+            {
+                "type": "header",
+                "text": {
+                    "type": "plain_text",
+                    "text": header,
+                    "emoji": True
+                }
+            },
+            {
+                "type": "divider"
+            }
+        ]
+        
+        # Add each todo as a section
+        for i, todo in enumerate(todos, 1):
+            description = todo.get('description', 'N/A')
+            assigned_to = todo.get('assigned_to')
+            
+            todo_text = f"*{i}.* {description}"
+            if assigned_to:
+                todo_text += f"\n👤 Assigned to: {assigned_to}"
+            
+            blocks.append({
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": todo_text
+                }
+            })
+            
+            # Add divider between todos (except after the last one)
+            if i < len(todos):
+                blocks.append({"type": "divider"})
+        
+        # Post to Slack
+        result = self.post_message(channel_name_or_id, message_text, blocks=blocks)
+        logger.info("Successfully posted todos to Slack")
+        return result
 
