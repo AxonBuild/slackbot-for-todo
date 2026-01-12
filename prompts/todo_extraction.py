@@ -81,6 +81,7 @@ def get_todo_extraction_prompt(
         bot_message_text += f"[{bot_timestamp}] {bot_text}"
         
         special_instructions = "- Refer to the last bot message from the channel when extracting todos to avoid duplicates."
+        special_instructions += "- If a todo is mentioned in the last bot message, do not mention it again"
     else:
         bot_message_text = ""
         special_instructions = ""
