@@ -33,15 +33,15 @@ class SlackService:
     
     def get_channel_messages(
         self, 
-        channel_name: str, 
+        channel_name_or_id: str, 
         minutes_ago: Optional[int] = None, 
         limit: int = 100
     ) -> List[Dict[str, Any]]:
         """
-        Fetch messages from a Slack channel.
+        Fetch messages from a Slack channel or conversation.
         
         Args:
-            channel_name: Name of the Slack channel
+            channel_name_or_id: Name of the Slack channel or channel ID (for DMs)
             minutes_ago: Number of minutes to look back (None = all messages)
             limit: Maximum number of messages to retrieve
         
@@ -52,29 +52,34 @@ class SlackService:
             ValueError: If channel is not found
             Exception: If there's an error fetching messages
         """
-        logger.info(f"Fetching messages from channel '{channel_name}' (limit={limit}, minutes_ago={minutes_ago})")
+        logger.info(f"Fetching messages from '{channel_name_or_id}' (limit={limit}, minutes_ago={minutes_ago})")
         
         try:
-            # Find channel ID
-            logger.debug("Listing available channels")
-            response = self.client.conversations_list(types="public_channel,private_channel")
-            channels = response["channels"]
-            logger.debug(f"Found {len(channels)} available channels")
-            
-            channel_id = None
-            for channel in channels:
-                if channel["name"].lower() == channel_name.lower():
-                    channel_id = channel["id"]
-                    logger.info(f"Found channel ID: {channel_id} for channel '{channel_name}'")
-                    break
-            
-            if not channel_id:
-                available_channels = [c['name'] for c in channels]
-                logger.error(f"Channel '{channel_name}' not found. Available: {', '.join(available_channels)}")
-                raise ValueError(
-                    f"Channel '{channel_name}' not found. "
-                    f"Available channels: {', '.join(available_channels)}"
-                )
+            # Check if it's already a channel ID (starts with C, D, or G)
+            if channel_name_or_id.startswith(('C', 'D', 'G')):
+                channel_id = channel_name_or_id
+                logger.info(f"Using provided channel ID: {channel_id}")
+            else:
+                # Find channel ID by name
+                logger.debug("Listing available channels")
+                response = self.client.conversations_list(types="public_channel,private_channel,mpim,im")
+                channels = response["channels"]
+                logger.debug(f"Found {len(channels)} available channels")
+                
+                channel_id = None
+                for channel in channels:
+                    if channel.get("name", "").lower() == channel_name_or_id.lower():
+                        channel_id = channel["id"]
+                        logger.info(f"Found channel ID: {channel_id} for channel '{channel_name_or_id}'")
+                        break
+                
+                if not channel_id:
+                    available_channels = [c.get('name', c.get('id')) for c in channels]
+                    logger.error(f"Channel '{channel_name_or_id}' not found. Available: {', '.join(available_channels)}")
+                    raise ValueError(
+                        f"Channel '{channel_name_or_id}' not found. "
+                        f"Available channels: {', '.join(available_channels)}"
+                    )
             
             # Calculate oldest timestamp if minutes_ago is specified
             oldest_ts = None
@@ -120,14 +125,27 @@ class SlackService:
     
     def list_channels(self) -> List[Dict[str, Any]]:
         """
-        List all available channels that the bot can access.
+        List all available channels and conversations that the bot is a member of.
+        This includes public channels, private channels, and direct messages.
         
         Returns:
-            List of channel dictionaries
+            List of channel/conversation dictionaries
         """
         try:
-            response = self.client.conversations_list(types="public_channel,private_channel")
-            return response["channels"]
+            # Get all conversations the bot is a member of
+            # Types: public_channel, private_channel, mpim (multi-party DM), im (direct message)
+            response = self.client.conversations_list(
+                types="public_channel,private_channel,mpim,im",
+                exclude_archived=True,
+                limit=1000  # Increase limit to get more channels
+            )
+            channels = response["channels"]
+            
+            # Filter to only conversations the bot is a member of
+            member_channels = [ch for ch in channels if ch.get('is_member', False)]
+            
+            logger.info(f"Bot is a member of {len(member_channels)} out of {len(channels)} total conversations")
+            return member_channels
         except SlackApiError as e:
             error_msg = e.response.get('error', str(e)) if hasattr(e, 'response') else str(e)
             raise Exception(f"Error listing channels: {error_msg}")
@@ -206,12 +224,12 @@ class SlackService:
         logger.debug(f"Enriched {len(enriched_messages)} messages with user names")
         return enriched_messages
     
-    def post_message(self, channel_name: str, text: str, blocks: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    def post_message(self, channel_name_or_id: str, text: str, blocks: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
         """
-        Post a message to a Slack channel.
+        Post a message to a Slack channel or conversation.
         
         Args:
-            channel_name: Name of the Slack channel
+            channel_name_or_id: Name of the Slack channel or channel ID (for DMs)
             text: Message text (fallback if blocks fail to render)
             blocks: Optional Slack Block Kit blocks for rich formatting
         
@@ -222,25 +240,30 @@ class SlackService:
             ValueError: If channel is not found
             Exception: If there's an error posting the message
         """
-        logger.info(f"Posting message to channel '{channel_name}'")
+        logger.info(f"Posting message to '{channel_name_or_id}'")
         
         try:
-            # Find channel ID
-            response = self.client.conversations_list(types="public_channel,private_channel")
-            channels = response["channels"]
-            
-            channel_id = None
-            for channel in channels:
-                if channel["name"].lower() == channel_name.lower():
-                    channel_id = channel["id"]
-                    break
-            
-            if not channel_id:
-                available_channels = [c['name'] for c in channels]
-                raise ValueError(
-                    f"Channel '{channel_name}' not found. "
-                    f"Available channels: {', '.join(available_channels)}"
-                )
+            # Check if it's already a channel ID (starts with C, D, or G)
+            if channel_name_or_id.startswith(('C', 'D', 'G')):
+                channel_id = channel_name_or_id
+                logger.info(f"Using provided channel ID: {channel_id}")
+            else:
+                # Find channel ID by name
+                response = self.client.conversations_list(types="public_channel,private_channel,mpim,im")
+                channels = response["channels"]
+                
+                channel_id = None
+                for channel in channels:
+                    if channel.get("name", "").lower() == channel_name_or_id.lower():
+                        channel_id = channel["id"]
+                        break
+                
+                if not channel_id:
+                    available_channels = [c.get('name', c.get('id')) for c in channels]
+                    raise ValueError(
+                        f"Channel '{channel_name_or_id}' not found. "
+                        f"Available channels: {', '.join(available_channels)}"
+                    )
             
             # Post message
             kwargs = {
@@ -252,7 +275,7 @@ class SlackService:
                 kwargs["blocks"] = blocks
             
             result = self.client.chat_postMessage(**kwargs)
-            logger.info(f"Successfully posted message to channel '{channel_name}'")
+            logger.info(f"Successfully posted message to '{channel_name_or_id}'")
             return result
         
         except SlackApiError as e:

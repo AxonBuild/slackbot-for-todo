@@ -2,12 +2,10 @@
 
 import logging
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
 import os
 from dotenv import load_dotenv
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.interval import IntervalTrigger
 
 from llm.client import create_llm_client
 from services.todo_extractor import TodoExtractor
@@ -24,29 +22,24 @@ load_dotenv()
 # Initialize FastAPI app
 app = FastAPI(
     title="Slack Todo Extraction API",
-    description="API to extract todos from Slack messages using LLM",
-    version="1.0.0"
+    description="API to extract todos from Slack messages using LLM - triggered by external schedulers",
+    version="2.0.0"
 )
 
-# Initialize services
+# Initialize services (lazy initialization)
 llm_client = None
 todo_extractor = None
 slack_service = None
-scheduler = None
 
 
-def initialize_services():
-    """Initialize LLM client, todo extractor, and Slack service."""
+def get_services():
+    """Get or initialize services."""
     global llm_client, todo_extractor, slack_service
     
     if llm_client is None:
         provider = os.getenv("LLM_PROVIDER", "openai")
-        model = os.getenv("LLM_MODEL")  # Optional model override
-        kwargs = {}
-        if model:
-            kwargs["model"] = model
-        logger.info(f"Initializing LLM client with provider: {provider}, model: {model or 'default'}")
-        llm_client = create_llm_client(provider=provider, **kwargs)
+        logger.info(f"Initializing LLM client with provider: {provider}")
+        llm_client = create_llm_client(provider=provider)
         todo_extractor = TodoExtractor(llm_client)
         logger.info("LLM client and TodoExtractor initialized")
     
@@ -54,95 +47,23 @@ def initialize_services():
         logger.info("Initializing Slack service")
         slack_service = SlackService()
         logger.info("Slack service initialized")
-
-
-def perform_todo_extraction():
-    """
-    Perform todo extraction from Slack messages.
-    This function is called by the scheduler.
-    """
-    logger.info("=" * 80)
-    logger.info("SCHEDULED TODO EXTRACTION STARTED")
-    logger.info("=" * 80)
     
-    try:
-        if not todo_extractor:
-            initialize_services()
-        
-        # Get configuration from environment
-        channel_name = os.getenv("SLACK_CHANNEL_NAME")
-        if not channel_name:
-            logger.error("SLACK_CHANNEL_NAME environment variable is missing")
-            return
-        
-        minutes_ago = os.getenv("SLACK_MINUTES_AGO")
-        if minutes_ago:
-            minutes_ago = int(minutes_ago)
-        else:
-            minutes_ago = None
-        
-        limit = int(os.getenv("SLACK_MESSAGE_LIMIT", "100"))
-        
-        logger.info(f"Configuration: channel={channel_name}, minutes_ago={minutes_ago}, limit={limit}")
-        
-        # Initialize services if needed
-        if not slack_service:
-            initialize_services()
-        
-        # Fetch messages from Slack
-        logger.info(f"Fetching messages from Slack channel: {channel_name}")
-        try:
-            messages = slack_service.get_channel_messages(channel_name, minutes_ago, limit)
-            logger.info(f"Retrieved {len(messages)} messages from Slack")
-        except Exception as e:
-            logger.error(f"Error fetching messages: {str(e)}", exc_info=True)
-            return
-        
-        if not messages:
-            logger.warning("No messages found in the specified time window")
-            return
-        
-        # Extract todos
-        logger.info(f"Extracting todos from {len(messages)} messages using LLM")
-        todos = todo_extractor.extract_todos(messages)
-        logger.info(f"Extracted {len(todos)} todos from messages")
-        
-        # Log the results
-        if todos:
-            logger.info("Extracted Todos:")
-            for i, todo in enumerate(todos, 1):
-                logger.info(f"  {i}. {todo.get('description', 'N/A')} (Assigned to: {todo.get('assigned_to', 'N/A')})")
-            
-            # Post todos to Slack channel if enabled
-            post_to_slack = os.getenv("POST_TODOS_TO_SLACK", "true").lower() == "true"
-            if post_to_slack:
-                try:
-                    _post_todos_to_slack(channel_name, todos)
-                except Exception as e:
-                    logger.error(f"Error posting todos to Slack: {str(e)}", exc_info=True)
-        else:
-            logger.info("No todos found in the messages")
-        
-        logger.info("=" * 80)
-        logger.info("SCHEDULED TODO EXTRACTION COMPLETED")
-        logger.info("=" * 80)
-        
-    except Exception as e:
-        logger.error(f"Error in scheduled todo extraction: {str(e)}", exc_info=True)
+    return slack_service, todo_extractor
 
 
-def _post_todos_to_slack(channel_name: str, todos: List[Dict[str, Any]]):
+# Removed scheduler function - API is now triggered by external schedulers
+
+
+def _post_todos_to_slack(channel_name_or_id: str, todos: List[Dict[str, Any]], service: SlackService):
     """
     Post extracted todos to Slack channel.
     
     Args:
-        channel_name: Name of the Slack channel
+        channel_name_or_id: Name or ID of the Slack channel
         todos: List of todo dictionaries
+        service: SlackService instance
     """
-    if not slack_service:
-        initialize_services()
-    
-    logger.info(f"Posting {len(todos)} todos to Slack channel: {channel_name}")
+    logger.info(f"Posting {len(todos)} todos to Slack channel: {channel_name_or_id}")
     
     # Format todos for Slack
     if len(todos) == 1:
@@ -198,65 +119,54 @@ def _post_todos_to_slack(channel_name: str, todos: List[Dict[str, Any]]):
             blocks.append({"type": "divider"})
     
     # Post to Slack
-    slack_service.post_message(channel_name, message_text, blocks=blocks)
+    service.post_message(channel_name_or_id, message_text, blocks=blocks)
     logger.info("Successfully posted todos to Slack")
 
 
-# Initialize on startup
 @app.on_event("startup")
 async def startup_event():
-    global scheduler
-    
-    logger.info("Starting up Slack Todo Extraction API")
-    initialize_services()
-    
-    # Set up scheduler for automatic todo extraction
-    scheduler_interval = int(os.getenv("SCHEDULER_INTERVAL_MINUTES", "30"))
-    scheduler_enabled = os.getenv("SCHEDULER_ENABLED", "true").lower() == "true"
-    
-    if scheduler_enabled:
-        logger.info(f"Setting up scheduler to run every {scheduler_interval} minutes")
-        scheduler = AsyncIOScheduler()
-        scheduler.add_job(
-            perform_todo_extraction,
-            trigger=IntervalTrigger(minutes=scheduler_interval),
-            id="todo_extraction_job",
-            name="Extract todos from Slack",
-            replace_existing=True
-        )
-        scheduler.start()
-        logger.info("Scheduler started successfully")
-    else:
-        logger.info("Scheduler is disabled (set SCHEDULER_ENABLED=false to disable)")
-    
+    logger.info("Starting up Slack Todo Extraction API v2.0")
+    logger.info("API ready - waiting for external scheduler to trigger requests")
     logger.info("API startup complete")
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    global scheduler
-    
     logger.info("Shutting down Slack Todo Extraction API")
-    if scheduler and scheduler.running:
-        scheduler.shutdown()
-        logger.info("Scheduler stopped")
     logger.info("API shutdown complete")
 
 
-# Response models
+# Request and Response models
 class Todo(BaseModel):
     """Todo model."""
     description: str
     assigned_to: Optional[str] = None
 
 
-class ExtractTodosResponse(BaseModel):
-    """Response model for todo extraction."""
+class ExtractTodosRequest(BaseModel):
+    """Request model for todo extraction."""
+    minutes_ago: Optional[int] = Field(default=30, description="Number of minutes to look back for messages")
+    message_limit: int = Field(default=100, description="Maximum messages to retrieve per channel", ge=1, le=1000)
+    post_to_slack: bool = Field(default=True, description="Whether to post extracted todos back to Slack")
+    channel_ids: Optional[List[str]] = Field(default=None, description="Specific channel IDs to process (None = all channels)")
+
+
+class ChannelResult(BaseModel):
+    """Result for a single channel."""
+    channel_id: str
+    channel_name: Optional[str] = None
     todos: List[Todo]
     total_messages: int
     todos_found: int
-    channel: Optional[str] = None
-    time_window_minutes: Optional[int] = None
+
+
+class ExtractTodosResponse(BaseModel):
+    """Response model for todo extraction."""
+    channels: List[ChannelResult]
+    total_channels_processed: int
+    total_todos_found: int
+    total_messages_processed: int
+    time_window_minutes: int
 
 
 @app.get("/")
@@ -264,9 +174,16 @@ async def root():
     """Root endpoint."""
     return {
         "message": "Slack Todo Extraction API",
-        "version": "1.0.0",
+        "version": "2.0.0",
+        "description": "Extract todos from Slack channels - designed to be triggered by external schedulers",
         "endpoints": {
-            "GET /extract-todos": "Extract todos from Slack channel (uses env config)"
+            "POST /extract-todos": "Extract todos from all or specific Slack channels",
+            "GET /channels": "List all channels the bot is a member of",
+            "GET /health": "Health check"
+        },
+        "environment": {
+            "llm_provider": os.getenv("LLM_PROVIDER", "openai"),
+            "slack_configured": bool(os.getenv("SLACK_BOT_TOKEN"))
         }
     }
 
@@ -280,101 +197,194 @@ async def health():
 
 
 
-@app.get("/extract-todos", response_model=ExtractTodosResponse)
-async def extract_todos_from_slack():
+@app.get("/channels")
+async def list_channels():
     """
-    Extract todos from Slack channel based on environment configuration.
-    
-    Uses environment variables:
-    - SLACK_CHANNEL_NAME: Channel to fetch messages from
-    - SLACK_MINUTES_AGO: Number of minutes to look back (optional)
-    - SLACK_MESSAGE_LIMIT: Maximum messages to retrieve (default: 100)
+    List all channels the bot is a member of.
     
     Returns:
-        ExtractTodosResponse with extracted todos
+        List of channels with their IDs and names
     """
-    logger.info("Extract todos endpoint called")
+    logger.info("List channels endpoint called")
     
-    if not todo_extractor:
-        initialize_services()
+    slack_svc, _ = get_services()
     
-    # Get configuration from environment
-    channel_name = os.getenv("SLACK_CHANNEL_NAME")
-    if not channel_name:
-        logger.error("SLACK_CHANNEL_NAME environment variable is missing")
-        raise HTTPException(
-            status_code=400,
-            detail="SLACK_CHANNEL_NAME environment variable is required"
-        )
-    
-    minutes_ago = os.getenv("SLACK_MINUTES_AGO")
-    if minutes_ago:
-        minutes_ago = int(minutes_ago)
-    else:
-        minutes_ago = None
-    
-    limit = int(os.getenv("SLACK_MESSAGE_LIMIT", "100"))
-    
-    logger.info(f"Configuration: channel={channel_name}, minutes_ago={minutes_ago}, limit={limit}")
-    
-    # Initialize services if needed
-    if not slack_service:
-        initialize_services()
-    
-    # Fetch messages from Slack
-    logger.info(f"Fetching messages from Slack channel: {channel_name}")
     try:
-        messages = slack_service.get_channel_messages(channel_name, minutes_ago, limit)
-        logger.info(f"Retrieved {len(messages)} messages from Slack")
-    except ValueError as e:
-        logger.error(f"Error fetching messages: {str(e)}")
-        raise HTTPException(status_code=404, detail=str(e))
+        channels = slack_svc.list_channels()
+        
+        result = []
+        for channel in channels:
+            result.append({
+                "id": channel.get("id"),
+                "name": channel.get("name"),
+                "is_channel": channel.get("is_channel", False),
+                "is_group": channel.get("is_group", False),
+                "is_im": channel.get("is_im", False),
+                "is_mpim": channel.get("is_mpim", False),
+            })
+        
+        logger.info(f"Returning {len(result)} channels")
+        return {
+            "channels": result,
+            "total": len(result)
+        }
     except Exception as e:
-        logger.error(f"Unexpected error fetching messages: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Error listing channels: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error listing channels: {str(e)}")
+
+
+@app.post("/extract-todos", response_model=ExtractTodosResponse)
+async def extract_todos_from_slack(request: ExtractTodosRequest):
+    """
+    Extract todos from Slack channels.
     
-    if not messages:
-        logger.warning("No messages found in the specified time window")
-        return ExtractTodosResponse(
-            todos=[],
-            total_messages=0,
-            todos_found=0,
-            channel=channel_name,
-            time_window_minutes=minutes_ago
-        )
+    Processes all channels the bot is a member of (or specific channels if provided).
+    Designed to be called by external schedulers (e.g., cron, Airflow, etc.).
     
-    # Extract todos
-    logger.info(f"Extracting todos from {len(messages)} messages using LLM")
-    todos = todo_extractor.extract_todos(messages)
-    logger.info(f"Extracted {len(todos)} todos from messages")
+    Request body parameters:
+    - minutes_ago: Number of minutes to look back (default: 30)
+    - message_limit: Max messages per channel (default: 100)
+    - post_to_slack: Whether to post todos back to channels (default: true)
+    - channel_ids: Specific channel IDs to process (optional, default: all channels)
     
-    # Post todos to Slack if enabled and todos found
-    if todos:
-        post_to_slack = os.getenv("POST_TODOS_TO_SLACK", "true").lower() == "true"
-        if post_to_slack:
+    Returns:
+        ExtractTodosResponse with todos per channel
+    """
+    logger.info("=" * 80)
+    logger.info("TODO EXTRACTION REQUEST RECEIVED")
+    logger.info("=" * 80)
+    logger.info(f"Config: minutes_ago={request.minutes_ago}, limit={request.message_limit}, post={request.post_to_slack}")
+    
+    slack_svc, extractor = get_services()
+    
+    try:
+        # Get channels to process
+        if request.channel_ids:
+            logger.info(f"Processing specific channels: {request.channel_ids}")
+            # Filter to requested channels
+            all_channels = slack_svc.list_channels()
+            channels = [ch for ch in all_channels if ch.get("id") in request.channel_ids]
+            if not channels:
+                raise HTTPException(status_code=404, detail=f"None of the specified channels found")
+        else:
+            logger.info("Processing all channels the bot is a member of")
+            channels = slack_svc.list_channels()
+        
+        channel_names = [c.get('name', c.get('id', 'Unknown')) for c in channels]
+        logger.info(f"Found {len(channels)} channels/conversations: {', '.join(channel_names)}")
+        
+        if not channels:
+            logger.warning("No channels found")
+            return ExtractTodosResponse(
+                channels=[],
+                total_channels_processed=0,
+                total_todos_found=0,
+                total_messages_processed=0,
+                time_window_minutes=request.minutes_ago
+            )
+        
+        # Process each channel
+        channel_results = []
+        total_todos = 0
+        total_messages = 0
+        
+        for channel in channels:
+            channel_name = channel.get('name', None)
+            channel_id = channel.get('id', 'Unknown')
+            
+            channel_identifier = channel_name if channel_name else channel_id
+            channel_display = f"#{channel_name}" if channel_name else f"DM:{channel_id}"
+            
+            logger.info(f"\n{'=' * 60}")
+            logger.info(f"Processing: {channel_display} (ID: {channel_id})")
+            logger.info(f"{'=' * 60}")
+            
             try:
-                _post_todos_to_slack(channel_name, todos)
+                # Fetch messages
+                messages = slack_svc.get_channel_messages(channel_id, request.minutes_ago, request.message_limit)
+                logger.info(f"Retrieved {len(messages)} messages from {channel_display}")
+                
+                if not messages:
+                    logger.info(f"No messages found in {channel_display}")
+                    channel_results.append(ChannelResult(
+                        channel_id=channel_id,
+                        channel_name=channel_name,
+                        todos=[],
+                        total_messages=0,
+                        todos_found=0
+                    ))
+                    continue
+                
+                total_messages += len(messages)
+                
+                # Extract todos
+                logger.info(f"Extracting todos from {len(messages)} messages in {channel_display}")
+                todos = extractor.extract_todos(messages)
+                logger.info(f"Extracted {len(todos)} todos from {channel_display}")
+                
+                # Convert to response model
+                todos_response = [
+                    Todo(
+                        description=todo["description"],
+                        assigned_to=todo.get("assigned_to")
+                    )
+                    for todo in todos
+                ]
+                
+                # Log todos
+                if todos:
+                    total_todos += len(todos)
+                    logger.info(f"Extracted Todos from {channel_display}:")
+                    for i, todo in enumerate(todos, 1):
+                        logger.info(f"  {i}. {todo.get('description', 'N/A')} (Assigned to: {todo.get('assigned_to', 'N/A')})")
+                    
+                    # Post to Slack if requested
+                    if request.post_to_slack and channel_identifier:
+                        try:
+                            _post_todos_to_slack(channel_identifier, todos, slack_svc)
+                        except Exception as e:
+                            logger.error(f"Error posting todos to {channel_display}: {str(e)}", exc_info=True)
+                else:
+                    logger.info(f"No todos found in {channel_display}")
+                
+                # Add to results
+                channel_results.append(ChannelResult(
+                    channel_id=channel_id,
+                    channel_name=channel_name,
+                    todos=todos_response,
+                    total_messages=len(messages),
+                    todos_found=len(todos_response)
+                ))
+                
             except Exception as e:
-                logger.error(f"Error posting todos to Slack: {str(e)}", exc_info=True)
-                # Don't fail the request if posting to Slack fails
-    
-    # Convert to response model
-    todos_response = [
-        Todo(
-            description=todo["description"],
-            assigned_to=todo.get("assigned_to")
+                logger.error(f"Error processing {channel_display}: {str(e)}", exc_info=True)
+                # Add error result
+                channel_results.append(ChannelResult(
+                    channel_id=channel_id,
+                    channel_name=channel_name,
+                    todos=[],
+                    total_messages=0,
+                    todos_found=0
+                ))
+                continue
+        
+        logger.info("=" * 80)
+        logger.info(f"TODO EXTRACTION COMPLETED - Total: {total_todos} todos, {total_messages} messages, {len(channels)} channels")
+        logger.info("=" * 80)
+        
+        return ExtractTodosResponse(
+            channels=channel_results,
+            total_channels_processed=len(channels),
+            total_todos_found=total_todos,
+            total_messages_processed=total_messages,
+            time_window_minutes=request.minutes_ago
         )
-        for todo in todos
-    ]
-    
-    logger.info(f"Returning {len(todos_response)} todos")
-    return ExtractTodosResponse(
-        todos=todos_response,
-        total_messages=len(messages),
-        todos_found=len(todos_response),
-        channel=channel_name,
-        time_window_minutes=minutes_ago
-    )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in todo extraction: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error extracting todos: {str(e)}")
 
 
 def create_app():
